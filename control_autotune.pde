@@ -103,3 +103,594 @@ struct autotune_state_struct {
     AutoTuneStepType    step                : 2;    // see AutoTuneStepType for what steps are performed
     AutoTuneTuneType    tune_type           : 2;    // see AutoTuneTuneType
 } autotune_state;
+
+
+// variables
+static uint32_t autotune_override_time;                                     // the last time the pilot overrode the controls
+static float    autotune_test_min;                                          // the minimum angular rate achieved during TESTING_RATE step
+static float    autotune_test_max;                                          // the maximum angular rate achieved during TESTING_RATE step
+static uint32_t autotune_step_start_time;                                   // start time of current tuning step (used for timeout checks)
+static int8_t   autotune_counter;                                           // counter for tuning gains
+static float    orig_roll_rp = 0, orig_roll_ri, orig_roll_rd, orig_roll_sp;     // backup of currently being tuned parameter values
+static float    orig_pitch_rp = 0, orig_pitch_ri, orig_pitch_rd, orig_pitch_sp; // backup of currently being tuned parameter values
+static float    tune_roll_rp, tune_roll_rd, tune_roll_sp;                   // currently being tuned parameter values
+static float    tune_pitch_rp, tune_pitch_rd, tune_pitch_sp;                // currently being tuned parameter values
+
+// autotune_init - should be called when autotune mode is selected
+static bool autotune_init(bool ignore_checks)
+{
+    bool success = true;
+
+    switch (autotune_state.mode) {
+        case AUTOTUNE_MODE_FAILED:
+            // autotune has been run but failed so reset state to uninitialised
+            autotune_state.mode = AUTOTUNE_MODE_UNINITIALISED;
+            // no break to allow fall through to restart the tuning
+        case AUTOTUNE_MODE_UNINITIALISED:
+            // autotune has never been run
+            success = autotune_start(false);
+            if (success) {
+                // so store current gains as original gains
+                autotune_backup_gains_and_initialise();
+                // advance mode to tuning
+                autotune_state.mode = AUTOTUNE_MODE_TUNING;
+                // send message to ground station that we've started tuning
+                autotune_update_gcs(AUTOTUNE_MESSAGE_STARTED);
+            }
+            break;
+
+        case AUTOTUNE_MODE_TUNING:
+            // we are restarting tuning after the user must have switched ch7/ch8 off so we restart tuning where we left off
+            success = autotune_start(false);
+            if (success) {
+                // reset gains to tuning-start gains (i.e. low I term)
+                autotune_load_intra_test_gains();
+                // write dataflash log even and send message to ground station
+                Log_Write_Event(DATA_AUTOTUNE_RESTART);
+                autotune_update_gcs(AUTOTUNE_MESSAGE_STARTED);
+            }
+            break;
+
+        case AUTOTUNE_MODE_SUCCESS:
+            // we have completed a tune and the pilot wishes to test the new gains in the current flight mode
+            // so simply apply tuning gains (i.e. do not change flight mode)
+            autotune_load_tuned_gains();
+            Log_Write_Event(DATA_AUTOTUNE_PILOT_TESTING);
+            break;
+    }
+
+    return success;
+}
+
+// autotune_stop - should be called when the ch7/ch8 switch is switched OFF
+static void autotune_stop()
+{
+    // set gains to their original values
+    autotune_load_orig_gains();
+
+    // re-enable angle-to-rate request limits
+    attitude_control.limit_angle_to_rate_request(true);
+
+    // log off event and send message to ground statoin
+    autotune_update_gcs(AUTOTUNE_MESSAGE_STOPPED);
+    Log_Write_Event(DATA_AUTOTUNE_OFF);
+
+    // Note: we leave the autotune_state.mode as it was so that we know how the autotune ended
+    // we expect the caller will change the flight mode back to the flight mode indicated by the flight mode switch
+}
+
+// autotune_start - initialise autotune flight mode
+static bool autotune_start(bool ignore_checks)
+{
+    // only allow flip from Stabilize or AltHold flight modes
+    if (control_mode != STABILIZE && control_mode != ALT_HOLD) {
+        return false;
+    }
+
+    // ensure throttle is above zero
+    if (g.rc_3.control_in <= 0) {
+        return false;
+    }
+
+    // ensure we are flying
+    if (!motors.armed() || !ap.auto_armed || ap.land_complete) {
+        return false;
+    }
+
+    // initialize vertical speeds and leash lengths
+    pos_control.set_speed_z(-g.pilot_velocity_z_max, g.pilot_velocity_z_max);
+    pos_control.set_accel_z(g.pilot_accel_z);
+
+    // initialise altitude target to stopping point
+    pos_control.set_target_to_stopping_point_z();
+
+    return true;
+}
+
+// autotune_run - runs the autotune flight mode
+// should be called at 100hz or more
+static void autotune_run()
+{
+    int16_t target_roll, target_pitch;
+    float target_yaw_rate;
+    int16_t target_climb_rate;
+
+    // if not auto armed set throttle to zero and exit immediately
+    // this should not actually be possible because of the autotune_init() checks
+    if(!ap.auto_armed) {
+        attitude_control.relax_bf_rate_controller();
+        attitude_control.set_yaw_target_to_current_heading();
+        attitude_control.set_throttle_out(0, false);
+        pos_control.set_alt_target_to_current_alt();
+        return;
+    }
+
+    // apply SIMPLE mode transform to pilot inputs
+    update_simple_mode();
+
+    // get pilot desired lean angles
+    get_pilot_desired_lean_angles(g.rc_1.control_in, g.rc_2.control_in, target_roll, target_pitch);
+
+    // get pilot's desired yaw rate
+    target_yaw_rate = get_pilot_desired_yaw_rate(g.rc_4.control_in);
+
+    // get pilot desired climb rate
+    target_climb_rate = get_pilot_desired_climb_rate(g.rc_3.control_in);
+
+    // check for pilot requested take-off - this should not actually be possible because of autotune_init() checks
+    if (ap.land_complete && target_climb_rate > 0) {
+        // indicate we are taking off
+        set_land_complete(false);
+        // clear i term when we're taking off
+        set_throttle_takeoff();
+    }
+
+    // reset target lean angles and heading while landed
+    if (ap.land_complete) {
+        attitude_control.relax_bf_rate_controller();
+        attitude_control.set_yaw_target_to_current_heading();
+        // move throttle to between minimum and non-takeoff-throttle to keep us on the ground
+        attitude_control.set_throttle_out(get_throttle_pre_takeoff(g.rc_3.control_in), false);
+        pos_control.set_alt_target_to_current_alt();
+    }else{
+        // check if pilot is overriding the controls
+        if (target_roll != 0 || target_pitch != 0 || target_yaw_rate != 0.0f || target_climb_rate != 0) {
+            if (!autotune_state.pilot_override) {
+                autotune_state.pilot_override = true;
+                // set gains to their original values
+                autotune_load_orig_gains();
+            }
+            // reset pilot override time
+            autotune_override_time = millis();
+        }else if (autotune_state.pilot_override) {
+            // check if we should resume tuning after pilot's override
+            if (millis() - autotune_override_time > AUTOTUNE_PILOT_OVERRIDE_TIMEOUT_MS) {
+                autotune_state.pilot_override = false;             // turn off pilot override
+                // set gains to their intra-test values (which are very close to the original gains)
+                autotune_load_intra_test_gains();
+                autotune_state.step = AUTOTUNE_STEP_WAITING_FOR_LEVEL; // set tuning step back from beginning
+                autotune_step_start_time = millis();
+            }
+        }
+
+        // if pilot override call attitude controller
+        if (autotune_state.pilot_override || autotune_state.mode != AUTOTUNE_MODE_TUNING) {
+            attitude_control.angle_ef_roll_pitch_rate_ef_yaw_smooth(target_roll, target_pitch, target_yaw_rate, get_smoothing_gain());
+        }else{
+            // somehow get attitude requests from autotuning
+            autotune_attitude_control();
+        }
+
+        // call position controller
+        pos_control.set_alt_target_from_climb_rate(target_climb_rate, G_Dt);
+        pos_control.update_z_controller();
+    }
+}
+
+// autotune_attitude_controller - sets attitude control targets during tuning
+static void autotune_attitude_control()
+{
+    float rotation_rate;        // rotation rate in radians/second
+    int32_t lean_angle;
+
+    // check tuning step
+    switch (autotune_state.step) {
+
+    case AUTOTUNE_STEP_WAITING_FOR_LEVEL:
+        // Note: we should be using intra-test gains (which are very close to the original gains but have lower I)
+        // re-enable rate limits
+        attitude_control.limit_angle_to_rate_request(true);
+
+        // hold level attitude
+        attitude_control.angle_ef_roll_pitch_rate_ef_yaw(0.0f, 0.0f, 0.0f);
+
+        // hold the copter level for 0.25 seconds before we begin a twitch
+        // reset counter if we are no longer level
+        if ((labs(ahrs.roll_sensor) > AUTOTUNE_LEVEL_ANGLE_CD) || (labs(ahrs.pitch_sensor) > AUTOTUNE_LEVEL_ANGLE_CD)) {
+            autotune_step_start_time = millis();
+        }
+
+        // if we have been level for a sufficient amount of time (0.25 seconds) move onto tuning step
+        if (millis() - autotune_step_start_time >= AUTOTUNE_REQUIRED_LEVEL_TIME_MS) {
+            // init variables for next step
+            autotune_state.step = AUTOTUNE_STEP_TWITCHING;
+            autotune_step_start_time = millis();
+            autotune_test_max = 0;
+            autotune_test_min = 0;
+            rotation_rate = 0;
+            // set gains to their to-be-tested values
+            autotune_load_twitch_gains();
+        }
+        break;
+
+    case AUTOTUNE_STEP_TWITCHING:
+        // Run the twitching step
+        // Note: we should be using intra-test gains (which are very close to the original gains but have lower I)
+
+        // disable rate limits
+        attitude_control.limit_angle_to_rate_request(false);
+
+        if(autotune_state.tune_type == AUTOTUNE_TYPE_SP_UP){
+            // Testing increasing stabilize P gain so will set lean angle target
+            if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                // request roll to 20deg
+                if (autotune_state.positive_direction) {
+                    attitude_control.angle_ef_roll_pitch_rate_ef_yaw(AUTOTUNE_TARGET_ANGLE_CD, 0.0f, 0.0f);
+                }else{
+                    attitude_control.angle_ef_roll_pitch_rate_ef_yaw(-AUTOTUNE_TARGET_ANGLE_CD, 0.0f, 0.0f);
+                }
+            }else{
+                // request pitch to 20deg
+                if (autotune_state.positive_direction) {
+                    attitude_control.angle_ef_roll_pitch_rate_ef_yaw(0.0f, AUTOTUNE_TARGET_ANGLE_CD, 0.0f);
+                }else{
+                    attitude_control.angle_ef_roll_pitch_rate_ef_yaw(0.0f, -AUTOTUNE_TARGET_ANGLE_CD, 0.0f);
+                }
+            }
+        } else {
+            // Testing rate P and D gains so will set body-frame rate targets
+            if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                // override body-frame roll rate (rate controller will use existing pitch and yaw body-frame rates and convert to motor outputs)
+                if (autotune_state.positive_direction) {
+                    attitude_control.rate_bf_roll_target(AUTOTUNE_TARGET_RATE_CDS);
+                }else{
+                    attitude_control.rate_bf_roll_target(-AUTOTUNE_TARGET_RATE_CDS);
+                }
+            }else{
+                // override body-frame pitch rate (rate controller will use existing roll and yaw body-frame rates and convert to motor outputs)
+                if (autotune_state.positive_direction) {
+                    attitude_control.rate_bf_pitch_target(AUTOTUNE_TARGET_RATE_CDS);
+                }else{
+                    attitude_control.rate_bf_pitch_target(-AUTOTUNE_TARGET_RATE_CDS);
+                }
+            }
+        }
+
+        // capture this iterations rotation rate and lean angle
+        if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+            // 20 Hz filter on rate
+            rotation_rate = ToDeg(fabs(ahrs.get_gyro().x)) * 100.0f;
+            lean_angle = labs(ahrs.roll_sensor);
+        }else{
+            // 20 Hz filter on rate
+            // rotation_rate = rotation_rate + 0.55686f*(ToDeg(fabs(ahrs.get_gyro().y))*100.0f-rotation_rate);
+            rotation_rate = ToDeg(fabs(ahrs.get_gyro().y)) * 100.0f;
+            lean_angle = labs(ahrs.pitch_sensor);
+        }
+        // log this iterations lean angle and rotation rate
+        Log_Write_AutoTuneDetails((int16_t)lean_angle, rotation_rate);
+
+        // compare rotation rate or lean angle to previous iterations of this testing step
+        if(autotune_state.tune_type == AUTOTUNE_TYPE_SP_UP){
+            // when tuning stabilize P gain, capture the max lean angle
+            if (lean_angle > autotune_test_max) {
+                autotune_test_max = lean_angle;
+                autotune_test_min = lean_angle;
+            }
+
+            // capture min lean angle
+            if (lean_angle < autotune_test_min && autotune_test_max > AUTOTUNE_TARGET_ANGLE_CD*(1-AUTOTUNE_AGGRESSIVENESS)) {
+                autotune_test_min = lean_angle;
+            }
+        }else{
+            // when tuning rate P and D gain, capture max rotation rate
+            if (rotation_rate > autotune_test_max) {
+                autotune_test_max = rotation_rate;
+                autotune_test_min = rotation_rate;
+            }
+
+            // capture min rotation rate after the rotation rate has peaked (aka "bounce back rate")
+            if (rotation_rate < autotune_test_min && autotune_test_max > AUTOTUNE_TARGET_RATE_CDS*0.5) {
+                autotune_test_min = rotation_rate;
+            }
+        }
+
+        // check for end of test conditions
+        // testing step time out after 0.5sec
+        if(millis() - autotune_step_start_time >= AUTOTUNE_TESTING_STEP_TIMEOUT_MS) {
+                autotune_state.step = AUTOTUNE_STEP_UPDATE_GAINS;
+        }
+        if(autotune_state.tune_type == AUTOTUNE_TYPE_SP_UP){
+            // stabilize P testing completes when the lean angle reaches 22deg or the vehicle has rotated 22deg
+            if ((lean_angle >= AUTOTUNE_TARGET_ANGLE_CD*(1+AUTOTUNE_AGGRESSIVENESS)) ||
+                    (autotune_test_max-autotune_test_min > AUTOTUNE_TARGET_ANGLE_CD*AUTOTUNE_AGGRESSIVENESS)) {
+                autotune_state.step = AUTOTUNE_STEP_UPDATE_GAINS;
+            }
+        }else{
+            // rate P and D testing completes when the vehicle reaches 20deg
+            if (lean_angle >= AUTOTUNE_TARGET_ANGLE_CD) {
+                autotune_state.step = AUTOTUNE_STEP_UPDATE_GAINS;
+            }
+            // rate P and D testing can also complete when the "bounce back rate" is at least 9deg less than the maximum rotation rate
+            if (autotune_state.tune_type == AUTOTUNE_TYPE_RD_UP || autotune_state.tune_type == AUTOTUNE_TYPE_RD_DOWN) {
+                if(autotune_test_max-autotune_test_min > AUTOTUNE_TARGET_RATE_CDS*AUTOTUNE_AGGRESSIVENESS) {
+                    autotune_state.step = AUTOTUNE_STEP_UPDATE_GAINS;
+                }
+            }
+        }
+        break;
+
+    case AUTOTUNE_STEP_UPDATE_GAINS:
+        // set gains to their intra-test values (which are very close to the original gains)
+        autotune_load_intra_test_gains();
+
+        // re-enable rate limits
+        attitude_control.limit_angle_to_rate_request(true);
+
+        // log the latest gains
+        if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+            Log_Write_AutoTune(autotune_state.axis, autotune_state.tune_type, autotune_test_min, autotune_test_max, tune_roll_rp, tune_roll_rd, tune_roll_sp);
+        }else{
+            Log_Write_AutoTune(autotune_state.axis, autotune_state.tune_type, autotune_test_min, autotune_test_max, tune_pitch_rp, tune_pitch_rd, tune_pitch_sp);
+        }
+
+        // Check results after mini-step to increase rate D gain
+        if (autotune_state.tune_type == AUTOTUNE_TYPE_RD_UP) {
+            // when tuning the rate D gain
+            if (autotune_test_max > AUTOTUNE_TARGET_RATE_CDS) {
+                // if max rotation rate was higher than target, reduce rate P
+                if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                    tune_roll_rp -= AUTOTUNE_RP_STEP;
+                    // abandon tuning if rate P falls below 0.01
+                    if(tune_roll_rp < AUTOTUNE_RP_MIN) {
+                        tune_roll_rp = AUTOTUNE_RP_MIN;
+                        autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                        Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                    }
+                }else{
+                    tune_pitch_rp -= AUTOTUNE_RP_STEP;
+                    // abandon tuning if rate P falls below 0.01
+                    if( tune_pitch_rp < AUTOTUNE_RP_MIN ) {
+                        tune_pitch_rp = AUTOTUNE_RP_MIN;
+                        autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                        Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                    }
+                }
+            // if maximum rotation rate was less than 80% of requested rate increase rate P
+            }else if(autotune_test_max < AUTOTUNE_TARGET_RATE_CDS*(1.0f-AUTOTUNE_AGGRESSIVENESS*2.0f) &&
+                    ((autotune_state.axis == AUTOTUNE_AXIS_ROLL && tune_roll_rp <= AUTOTUNE_RP_MAX) ||
+                    (autotune_state.axis == AUTOTUNE_AXIS_PITCH && tune_pitch_rp <= AUTOTUNE_RP_MAX)) ) {
+                if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                    tune_roll_rp += AUTOTUNE_RP_STEP*2.0f;
+                }else{
+                    tune_pitch_rp += AUTOTUNE_RP_STEP*2.0f;
+                }
+            }else{
+                // if "bounce back rate" if greater than 10% of requested rate (i.e. >9deg/sec) this is a good tune
+                if (autotune_test_max-autotune_test_min > AUTOTUNE_TARGET_RATE_CDS*AUTOTUNE_AGGRESSIVENESS) {
+                    autotune_counter++;
+                }else{
+                    // bounce back was too small so reduce number of good tunes
+                    if (autotune_counter > 0 ) {
+                        autotune_counter--;
+                    }
+                    // increase rate D (which should increase "bounce back rate")
+                    if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                        tune_roll_rd += AUTOTUNE_RD_STEP*2.0f;
+                        // stop tuning if we hit max D
+                        if (tune_roll_rd >= AUTOTUNE_RD_MAX) {
+                            tune_roll_rd = AUTOTUNE_RD_MAX;
+                            autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                            Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                        }
+                    }else{
+                        tune_pitch_rd += AUTOTUNE_RD_STEP*2.0f;
+                        // stop tuning if we hit max D
+                        if (tune_pitch_rd >= AUTOTUNE_RD_MAX) {
+                            tune_pitch_rd = AUTOTUNE_RD_MAX;
+                            autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                            Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                        }
+                    }
+                }
+            }
+        // Check results after mini-step to decrease rate D gain
+        } else if (autotune_state.tune_type == AUTOTUNE_TYPE_RD_DOWN) {
+            if (autotune_test_max > AUTOTUNE_TARGET_RATE_CDS) {
+                // if max rotation rate was higher than target, reduce rate P
+                if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                    tune_roll_rp -= AUTOTUNE_RP_STEP;
+                    // reduce rate D if tuning if rate P falls below 0.01
+                    if(tune_roll_rp < AUTOTUNE_RP_MIN) {
+                        tune_roll_rp = AUTOTUNE_RP_MIN;
+                        tune_roll_rd -= AUTOTUNE_RD_STEP;
+                        // stop tuning if we hit min D
+                        if (tune_roll_rd <= AUTOTUNE_RD_MIN) {
+                            tune_roll_rd = AUTOTUNE_RD_MIN;
+                            autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                            Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                        }
+                    }
+                }else{
+                    tune_pitch_rp -= AUTOTUNE_RP_STEP;
+                    // reduce rate D if tuning if rate P falls below 0.01
+                    if( tune_pitch_rp < AUTOTUNE_RP_MIN ) {
+                        tune_pitch_rp = AUTOTUNE_RP_MIN;
+                        tune_pitch_rd -= AUTOTUNE_RD_STEP;
+                        // stop tuning if we hit min D
+                        if (tune_pitch_rd <= AUTOTUNE_RD_MIN) {
+                            tune_pitch_rd = AUTOTUNE_RD_MIN;
+                            autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                            Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                        }
+                    }
+                }
+            // if maximum rotation rate was less than 80% of requested rate increase rate P
+            }else if(autotune_test_max < AUTOTUNE_TARGET_RATE_CDS*(1-AUTOTUNE_AGGRESSIVENESS*2.0f) &&
+                    ((autotune_state.axis == AUTOTUNE_AXIS_ROLL && tune_roll_rp <= AUTOTUNE_RP_MAX) ||
+                    (autotune_state.axis == AUTOTUNE_AXIS_PITCH && tune_pitch_rp <= AUTOTUNE_RP_MAX)) ) {
+                if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                    tune_roll_rp += AUTOTUNE_RP_STEP;
+                }else{
+                    tune_pitch_rp += AUTOTUNE_RP_STEP;
+                }
+            }else{
+                // if "bounce back rate" if less than 10% of requested rate (i.e. >9deg/sec) this is a good tune
+                if (autotune_test_max-autotune_test_min < AUTOTUNE_TARGET_RATE_CDS*AUTOTUNE_AGGRESSIVENESS) {
+                    autotune_counter++;
+                }else{
+                    // bounce back was too large so reduce number of good tunes
+                    if (autotune_counter > 0 ) {
+                        autotune_counter--;
+                    }
+                    // decrease rate D (which should decrease "bounce back rate")
+                    if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                        tune_roll_rd -= AUTOTUNE_RD_STEP;
+                        // stop tuning if we hit min D
+                        if (tune_roll_rd <= AUTOTUNE_RD_MIN) {
+                            tune_roll_rd = AUTOTUNE_RD_MIN;
+                            autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                            Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                        }
+                    }else{
+                        tune_pitch_rd -= AUTOTUNE_RD_STEP;
+                        // stop tuning if we hit min D
+                        if (tune_pitch_rd <= AUTOTUNE_RD_MIN) {
+                            tune_pitch_rd = AUTOTUNE_RD_MIN;
+                            autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                            Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                        }
+                    }
+                }
+            }
+        // Check results after mini-step to increase rate P gain
+        } else if (autotune_state.tune_type == AUTOTUNE_TYPE_RP_UP) {
+            // if max rotation rate greater than target, this is a good tune
+            if (autotune_test_max > AUTOTUNE_TARGET_RATE_CDS) {
+                autotune_counter++;
+            }else{
+                // rotation rate was too low so reduce number of good tunes
+                if (autotune_counter > 0 ) {
+                    autotune_counter--;
+                }
+                // increase rate P and I gains
+                if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                    tune_roll_rp += AUTOTUNE_RP_STEP;
+                    // stop tuning if we hit max P
+                    if (tune_roll_rp >= AUTOTUNE_RP_MAX) {
+                        tune_roll_rp = AUTOTUNE_RP_MAX;
+                        autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                        Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                    }
+                }else{
+                    tune_pitch_rp += AUTOTUNE_RP_STEP;
+                    // stop tuning if we hit max P
+                    if (tune_pitch_rp >= AUTOTUNE_RP_MAX) {
+                        tune_pitch_rp = AUTOTUNE_RP_MAX;
+                        autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                        Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                    }
+                }
+            }
+        // Check results after mini-step to increase stabilize P gain
+        } else if (autotune_state.tune_type == AUTOTUNE_TYPE_SP_UP) {
+            // if max angle reaches 22deg this is a successful tune
+            if (autotune_test_max > AUTOTUNE_TARGET_ANGLE_CD*(1+AUTOTUNE_AGGRESSIVENESS) ||
+                    (autotune_test_max-autotune_test_min > AUTOTUNE_TARGET_ANGLE_CD*AUTOTUNE_AGGRESSIVENESS)) {
+                autotune_counter++;
+            }else{
+                // did not reach the target angle so this is a bad tune
+                if (autotune_counter > 0 ) {
+                    autotune_counter--;
+                }
+                // increase stabilize P and I gains
+                if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                    tune_roll_sp += AUTOTUNE_SP_STEP;
+                    // stop tuning if we hit max P
+                    if (tune_roll_sp >= AUTOTUNE_SP_MAX) {
+                        tune_roll_sp = AUTOTUNE_SP_MAX;
+                        autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                        Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                    }
+                }else{
+                    tune_pitch_sp += AUTOTUNE_SP_STEP;
+                    // stop tuning if we hit max P
+                    if (tune_pitch_sp >= AUTOTUNE_SP_MAX) {
+                        tune_pitch_sp = AUTOTUNE_SP_MAX;
+                        autotune_counter = AUTOTUNE_SUCCESS_COUNT;
+                        Log_Write_Event(DATA_AUTOTUNE_REACHED_LIMIT);
+                    }
+                }
+            }
+        }
+
+        // reverse direction
+        autotune_state.positive_direction = !autotune_state.positive_direction;
+
+        // we've complete this step, finalise pids and move to next step
+        if (autotune_counter >= AUTOTUNE_SUCCESS_COUNT) {
+
+            // reset counter
+            autotune_counter = 0;
+
+            // move to the next tuning type
+            if (autotune_state.tune_type < AUTOTUNE_TYPE_SP_UP) {
+                autotune_state.tune_type++;
+            }else{
+                // we've reached the end of a D-up-down PI-up-down tune type cycle
+                autotune_state.tune_type = AUTOTUNE_TYPE_RD_UP;
+
+                // if we've just completed roll move onto pitch
+                if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+                    tune_roll_sp = tune_roll_sp * AUTOTUNE_SP_BACKOFF;
+                    autotune_state.axis = AUTOTUNE_AXIS_PITCH;
+                    AP_Notify::events.autotune_next_axis = 1;
+                }else{
+                    tune_pitch_sp = tune_pitch_sp * AUTOTUNE_SP_BACKOFF;
+                    tune_roll_sp = min(tune_roll_sp, tune_pitch_sp);
+                    tune_pitch_sp = min(tune_roll_sp, tune_pitch_sp);
+                    // if we've just completed pitch we have successfully completed the autotune
+                    // change to TESTING mode to allow user to fly with new gains
+                    autotune_state.mode = AUTOTUNE_MODE_SUCCESS;
+                    autotune_update_gcs(AUTOTUNE_MESSAGE_SUCCESS);
+                    Log_Write_Event(DATA_AUTOTUNE_SUCCESS);
+
+                    // play a tone
+                    AP_Notify::events.autotune_complete = 1;
+                }
+            }
+        }
+
+        // reset testing step
+        autotune_state.step = AUTOTUNE_STEP_WAITING_FOR_LEVEL;
+        autotune_step_start_time = millis();
+        break;
+    }
+}
+
+// autotune has failed, return to standard gains and log event
+//  called when the autotune is unable to find good gains
+static void autotune_failed()
+{
+    // set autotune mode to failed so that it cannot restart
+    autotune_state.mode = AUTOTUNE_MODE_FAILED;
+    // set gains to their original values
+    autotune_load_orig_gains();
+    // re-enable angle-to-rate request limits
+    attitude_control.limit_angle_to_rate_request(true);
+    // log failure
+    Log_Write_Event(DATA_AUTOTUNE_FAILED);
+
+    // play a tone
+    AP_Notify::events.autotune_failed = 1;
+}
