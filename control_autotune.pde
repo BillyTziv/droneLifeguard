@@ -694,3 +694,203 @@ static void autotune_failed()
     // play a tone
     AP_Notify::events.autotune_failed = 1;
 }
+
+// autotune has failed, return to standard gains and log event
+//  called when the autotune is unable to find good gains
+static void autotune_failed()
+{
+    // set autotune mode to failed so that it cannot restart
+    autotune_state.mode = AUTOTUNE_MODE_FAILED;
+    // set gains to their original values
+    autotune_load_orig_gains();
+    // re-enable angle-to-rate request limits
+    attitude_control.limit_angle_to_rate_request(true);
+    // log failure
+    Log_Write_Event(DATA_AUTOTUNE_FAILED);
+
+    // play a tone
+    AP_Notify::events.autotune_failed = 1;
+}
+
+// autotune_backup_gains_and_initialise - store current gains as originals
+//  called before tuning starts to backup original gains
+static void autotune_backup_gains_and_initialise()
+{
+    // initialise state because this is our first time
+    autotune_state.axis = AUTOTUNE_AXIS_ROLL;
+    autotune_state.positive_direction = false;
+    autotune_state.step = AUTOTUNE_STEP_WAITING_FOR_LEVEL;
+    autotune_step_start_time = millis();
+    autotune_state.tune_type = AUTOTUNE_TYPE_RD_UP;
+
+    // backup original pids
+    orig_roll_rp = g.pid_rate_roll.kP();
+    orig_roll_ri = g.pid_rate_roll.kI();
+    orig_roll_rd = g.pid_rate_roll.kD();
+    orig_roll_sp = g.p_stabilize_roll.kP();
+    orig_pitch_rp = g.pid_rate_pitch.kP();
+    orig_pitch_ri = g.pid_rate_pitch.kI();
+    orig_pitch_rd = g.pid_rate_pitch.kD();
+    orig_pitch_sp = g.p_stabilize_pitch.kP();
+
+    // initialise tuned pid values
+    tune_roll_rp = g.pid_rate_roll.kP();
+    tune_roll_rd = g.pid_rate_roll.kD();
+    tune_roll_sp = g.p_stabilize_roll.kP();
+    tune_pitch_rp = g.pid_rate_pitch.kP();
+    tune_pitch_rd = g.pid_rate_pitch.kD();
+    tune_pitch_sp = g.p_stabilize_pitch.kP();
+
+    Log_Write_Event(DATA_AUTOTUNE_INITIALISED);
+}
+
+// autotune_load_orig_gains - set gains to their original values
+//  called by autotune_stop and autotune_failed functions
+static void autotune_load_orig_gains()
+{
+    // sanity check the original gains
+    if (orig_roll_rp != 0 && orig_pitch_rp != 0) {
+        g.pid_rate_roll.kP(orig_roll_rp);
+        g.pid_rate_roll.kI(orig_roll_ri);
+        g.pid_rate_roll.kD(orig_roll_rd);
+        g.p_stabilize_roll.kP(orig_roll_sp);
+        g.pid_rate_pitch.kP(orig_pitch_rp);
+        g.pid_rate_pitch.kI(orig_pitch_ri);
+        g.pid_rate_pitch.kD(orig_pitch_rd);
+        g.p_stabilize_pitch.kP(orig_pitch_sp);
+    }
+}
+
+// autotune_load_tuned_gains - load tuned gains
+static void autotune_load_tuned_gains()
+{
+    // sanity check the gains
+    if (tune_roll_rp != 0 && tune_pitch_rp != 0) {
+        g.pid_rate_roll.kP(tune_roll_rp);
+        g.pid_rate_roll.kI(tune_roll_rp*AUTOTUNE_RP_RATIO_FINAL);
+        g.pid_rate_roll.kD(tune_roll_rd);
+        g.p_stabilize_roll.kP(tune_roll_sp);
+        g.pid_rate_pitch.kP(tune_pitch_rp);
+        g.pid_rate_pitch.kI(tune_pitch_rp*AUTOTUNE_RP_RATIO_FINAL);
+        g.pid_rate_pitch.kD(tune_pitch_rd);
+        g.p_stabilize_pitch.kP(tune_pitch_sp);
+    }else{
+        // log an error message and fail the autotune
+        Log_Write_Error(ERROR_SUBSYSTEM_AUTOTUNE,ERROR_CODE_AUTOTUNE_BAD_GAINS);
+    }
+}
+
+// autotune_load_intra_test_gains - gains used between tests
+//  called during testing mode's update-gains step to set gains ahead of return-to-level step
+static void autotune_load_intra_test_gains()
+{
+    // we are restarting tuning so reset gains to tuning-start gains (i.e. low I term)
+    // sanity check the original gains
+    if (orig_roll_rp != 0 && orig_pitch_rp != 0) {
+        g.pid_rate_roll.kP(orig_roll_rp);
+        g.pid_rate_roll.kI(orig_roll_rp*AUTOTUNE_PI_RATIO_FOR_TESTING);
+        g.pid_rate_roll.kD(orig_roll_rd);
+        g.p_stabilize_roll.kP(orig_roll_sp);
+        g.pid_rate_pitch.kP(orig_pitch_rp);
+        g.pid_rate_pitch.kI(orig_pitch_rp*AUTOTUNE_PI_RATIO_FOR_TESTING);
+        g.pid_rate_pitch.kD(orig_pitch_rd);
+        g.p_stabilize_pitch.kP(orig_pitch_sp);
+    }else{
+        // log an error message and fail the autotune
+        Log_Write_Error(ERROR_SUBSYSTEM_AUTOTUNE,ERROR_CODE_AUTOTUNE_BAD_GAINS);
+    }
+}
+
+// autotune_load_twitch_gains - load the to-be-tested gains for a single axis
+//  called by autotune_attitude_control() just before it beings testing a gain (i.e. just before it twitches)
+static void autotune_load_twitch_gains()
+{
+    if (autotune_state.axis == AUTOTUNE_AXIS_ROLL) {
+        if (tune_roll_rp != 0) {
+            g.pid_rate_roll.kP(tune_roll_rp);
+            g.pid_rate_roll.kI(tune_roll_rp*0.01f);
+            g.pid_rate_roll.kD(tune_roll_rd);
+            g.p_stabilize_roll.kP(tune_roll_sp);
+        }else{
+            // log an error message and fail the autotune
+            Log_Write_Error(ERROR_SUBSYSTEM_AUTOTUNE,ERROR_CODE_AUTOTUNE_BAD_GAINS);
+        }
+    }else{
+        if (tune_pitch_rp != 0) {
+            g.pid_rate_pitch.kP(tune_pitch_rp);
+            g.pid_rate_pitch.kI(tune_pitch_rp*0.01f);
+            g.pid_rate_pitch.kD(tune_pitch_rd);
+            g.p_stabilize_pitch.kP(tune_pitch_sp);
+        }else{
+            // log an error message and fail the autotune
+            Log_Write_Error(ERROR_SUBSYSTEM_AUTOTUNE,ERROR_CODE_AUTOTUNE_BAD_GAINS);
+        }
+    }
+}
+
+// save discovered gains to eeprom if autotuner is enabled (i.e. switch is in the high position)
+static void autotune_save_tuning_gains()
+{
+    // if we successfully completed tuning
+    if (autotune_state.mode == AUTOTUNE_MODE_SUCCESS) {
+        // sanity check the rate P values
+        if (tune_roll_rp != 0 && tune_pitch_rp != 0) {
+
+            // rate roll gains
+            g.pid_rate_roll.kP(tune_roll_rp);
+            g.pid_rate_roll.kI(tune_roll_rp*AUTOTUNE_RP_RATIO_FINAL);
+            g.pid_rate_roll.kD(tune_roll_rd);
+            g.pid_rate_roll.save_gains();
+
+            // rate pitch gains
+            g.pid_rate_pitch.kP(tune_pitch_rp);
+            g.pid_rate_pitch.kI(tune_pitch_rp*AUTOTUNE_RP_RATIO_FINAL);
+            g.pid_rate_pitch.kD(tune_pitch_rd);
+            g.pid_rate_pitch.save_gains();
+
+            // stabilize roll
+            g.p_stabilize_roll.kP(tune_roll_sp);
+            g.p_stabilize_roll.save_gains();
+
+            // stabilize pitch
+            g.p_stabilize_pitch.save_gains();
+            g.p_stabilize_pitch.kP(tune_pitch_sp);
+
+            // resave pids to originals in case the autotune is run again
+            orig_roll_rp = g.pid_rate_roll.kP();
+            orig_roll_ri = g.pid_rate_roll.kI();
+            orig_roll_rd = g.pid_rate_roll.kD();
+            orig_roll_sp = g.p_stabilize_roll.kP();
+            orig_pitch_rp = g.pid_rate_pitch.kP();
+            orig_pitch_ri = g.pid_rate_pitch.kI();
+            orig_pitch_rd = g.pid_rate_pitch.kD();
+            orig_pitch_sp = g.p_stabilize_pitch.kP();
+
+            // log save gains event
+            Log_Write_Event(DATA_AUTOTUNE_SAVEDGAINS);
+        }else{
+            // log an error message and fail the autotune
+            Log_Write_Error(ERROR_SUBSYSTEM_AUTOTUNE,ERROR_CODE_AUTOTUNE_BAD_GAINS);
+        }
+    }
+}
+
+// send message to ground station
+void autotune_update_gcs(uint8_t message_id)
+{
+    switch (message_id) {
+        case AUTOTUNE_MESSAGE_STARTED:
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("AutoTune: Started"));
+            break;
+        case AUTOTUNE_MESSAGE_STOPPED:
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("AutoTune: Stopped"));
+            break;
+        case AUTOTUNE_MESSAGE_SUCCESS:
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("AutoTune: Success"));
+            break;
+        case AUTOTUNE_MESSAGE_FAILED:
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("AutoTune: Failed"));
+            break;
+    }
+}
+#endif  // AUTOTUNE_ENABLED == ENABLED
