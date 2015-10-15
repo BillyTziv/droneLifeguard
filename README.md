@@ -17,7 +17,9 @@ The answer is a lot, and in emergency situations time is the difference between 
  3. Lives can be saved, by minimising response time.
  4. The project is based on open source software and hardware and itself is **open source**!
 
+**Photos**:
 
-
+![alt tag](https://raw.githubusercontent.com/ellak-monades-aristeias/droneLifeguard/master/droneLifeguard.jpg)
+>(Top side of the drone + RC Transmitter)
 
 
